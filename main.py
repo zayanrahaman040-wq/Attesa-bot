@@ -1,14 +1,18 @@
 import discord
-from discord.ext import commands, tasks
-import asyncio
+from discord.ext import commands
 import os
+import asyncio
 import yt_dlp
 
 TOKEN = os.getenv("TOKEN")
+
+# ID TUOI
 VOICE_CHANNEL_ID = 1575378302913216552
-LOG_CHANNEL_ID = 1570934757657804914
+LOG_CHANNEL_ID = 1575421052402020493
 STAFF_ROLE_ID = 1574914867939516517
-CANZONE = "Interlinked Ambient"  # Cerca su YouTube
+
+# Musica di sottofondo - puoi cambiare link
+MUSIC_URL = "https://www.youtube.com/watch?v=5qap5aO4i9A"  # lofi 24/7
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -18,110 +22,102 @@ intents.guilds = True
 
 bot = commands.Bot(command_prefix="/", intents=intents)
 
-# Config per prendere l'audio da YouTube
+# Config yt-dlp
 ydl_opts = {
     'format': 'bestaudio/best',
-    'noplaylist': True,
     'quiet': True,
-    'default_search': 'ytsearch',
+    'no_warnings': True,
+    'default_search': 'auto',
     'source_address': '0.0.0.0',
+    'noplaylist': True,
 }
 
-async def entra_e_canta():
-    channel = bot.get_channel(VOICE_CHANNEL_ID)
-    if channel is None:
-        return
-    vc = discord.utils.get(bot.voice_clients, guild=channel.guild)
-    if vc is None or not vc.is_connected():
+def get_audio_url(url):
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        return info['url']
+
+async def play_music(vc):
+    while True:
         try:
-            vc = await channel.connect(reconnect=True, timeout=60)
-            print(f"Entrato in {channel.name}")
+            if not vc.is_connected():
+                return
+            loop = asyncio.get_event_loop()
+            audio_url = await loop.run_in_executor(None, get_audio_url, MUSIC_URL)
+            source = await discord.FFmpegOpusAudio.from_probe(audio_url, method='fallback')
+            vc.play(source)
+            print("Musica partita", flush=True)
+            while vc.is_playing() or vc.is_paused():
+                await asyncio.sleep(1)
+            await asyncio.sleep(1)
         except Exception as e:
-            print(f"Errore entrata: {e}")
-            return
-    elif vc.channel.id != VOICE_CHANNEL_ID:
-        await vc.move_to(channel)
-
-    # Se non sta già cantando, parte la canzone
-    if not vc.is_playing() and not vc.is_paused():
-        await suona(vc)
-
-async def suona(vc):
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(CANZONE, download=False)
-            if 'entries' in info:
-                info = info['entries'][0]
-            url = info['url']
-            print(f"Suono: {info.get('title')}")
-
-        # FFmpeg - con reconnect per non farla fermare
-        source = discord.FFmpegPCMAudio(
-            url,
-            before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-            options="-vn"
-        )
-        # Quando finisce, riparte da sola in loop
-        vc.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(suona(vc), bot.loop))
-    except Exception as e:
-        print(f"Errore musica: {e}")
-        await asyncio.sleep(5)
-        await suona(vc)
+            print(f"Errore musica: {e}", flush=True)
+            await asyncio.sleep(5)
 
 @bot.event
 async def on_ready():
-    print(f"Online: {bot.user}")
-    await bot.tree.sync()
-    await entra_e_canta()
-    controlla_vocale.start()
+    print(f"Online: {bot.user}", flush=True)
+    try:
+        await bot.tree.sync()
+        print("Comandi sincronizzati", flush=True)
+    except Exception as e:
+        print(f"Errore sync: {e}", flush=True)
 
-@tasks.loop(seconds=10)
-async def controlla_vocale():
-    await entra_e_canta()
+    channel = bot.get_channel(VOICE_CHANNEL_ID)
+    if channel:
+        try:
+            vc = await channel.connect()
+            print(f"Entrato in {channel.name}", flush=True)
+            bot.loop.create_task(play_music(vc))
+        except Exception as e:
+            print(f"Errore VC: {e}", flush=True)
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    if member.id == bot.user.id:
-        if after.channel is None:
-            print("Mi hanno buttato fuori, rientro...")
-            await asyncio.sleep(2)
-            await entra_e_canta()
+    # Ignora il bot stesso
+    if member.bot:
         return
 
-    log_channel = bot.get_channel(LOG_CHANNEL_ID)
-    if log_channel is None:
-        return
+    # Qualcuno ENTRA nel canale assistenza
+    if after.channel and after.channel.id == VOICE_CHANNEL_ID:
+        if before.channel != after.channel:
+            log_channel = bot.get_channel(LOG_CHANNEL_ID)
+            if log_channel:
+                try:
+                    await log_channel.send(
+                        f"<@&{STAFF_ROLE_ID}> 🔔 **{member.mention} è entrato!**\n"
+                        f"La persona è in attesa **Assistenza** e vi aspetta!"
+                    )
+                    print(f"Avvisato staff per {member.name}", flush=True)
+                except Exception as e:
+                    print(f"Errore invio log: {e}", flush=True)
 
-    if before.channel is None and after.channel is not None and after.channel.id == VOICE_CHANNEL_ID:
-        await log_channel.send(
-            f"<@&{STAFF_ROLE_ID}> 🔔 **{member.mention} è entrato!**\n"
-            f"La persona è in attesa **Assistenza** e vi aspetta!"
-        )
-        return
+    # Qualcuno ESCE
+    if before.channel and before.channel.id == VOICE_CHANNEL_ID:
+        if after.channel != before.channel:
+            log_channel = bot.get_channel(LOG_CHANNEL_ID)
+            if log_channel:
+                try:
+                    await log_channel.send(
+                        f"👋 **{member.mention} è uscito** dal canale Assistenza."
+                    )
+                except Exception as e:
+                    print(f"Errore invio log uscita: {e}", flush=True)
 
-    if before.channel is not None and before.channel.id == VOICE_CHANNEL_ID and after.channel is None:
-        kicker = None
-        try:
-            async for entry in member.guild.audit_logs(limit=3, action=discord.AuditLogAction.member_disconnect):
-                if entry.target and entry.target.id == member.id:
-                    diff = (discord.utils.utcnow() - entry.created_at).total_seconds()
-                    if diff < 10:
-                        kicker = entry.user
-                        break
-        except Exception as e:
-            print(f"Errore audit log: {e}")
+@bot.tree.command(name="join", description="Fa entrare il bot in VC")
+async def join_cmd(interaction: discord.Interaction):
+    await interaction.response.send_message("Sono dentro!", ephemeral=True)
+    channel = bot.get_channel(VOICE_CHANNEL_ID)
+    if channel:
+        if interaction.guild.voice_client:
+            return
+        vc = await channel.connect()
+        bot.loop.create_task(play_music(vc))
 
-        if kicker:
-            await log_channel.send(
-                f"⚠️ **WARN** <@&{STAFF_ROLE_ID}>\n"
-                f"{kicker.mention} ha buttato fuori dal VC **{member.mention}** ({member.name})!"
-            )
-        else:
-            await log_channel.send(f"👋 **{member.mention}** è uscito dal canale voce.")
-
-@bot.tree.command(name="join", description="Entra in VC e canta Interlinked Ambient")
-async def join(interaction: discord.Interaction):
-    await interaction.response.send_message("Entro e canto 🎵", ephemeral=True)
-    await entra_e_canta()
+@bot.tree.command(name="stop", description="Ferma la musica")
+async def stop_cmd(interaction: discord.Interaction):
+    if interaction.guild.voice_client:
+        interaction.guild.voice_client.stop()
+        await interaction.response.send_message("Musica stoppata", ephemeral=True)
 
 bot.run(TOKEN)
